@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import json
 import os
+import json
 import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,110 +13,75 @@ from telegram.ext import (
     ContextTypes
 )
 
-import mailslurp_client
 from mailslurp_client import Configuration, ApiClient
 from mailslurp_client.api.inbox_controller_api import InboxControllerApi
-from mailslurp_client.api.email_controller_api import EmailControllerApi
+from mailslurp_client.api.wait_for_controller_api import WaitForControllerApi
 
 import config
 
-
-# ------------------------ Logging Setup ------------------------
+# ─── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ------------------------ Data File Handling ------------------------
+# ─── Data file ──────────────────────────────────────────────────
 DATA_FILE = "data.json"
-
 def load_data():
-    """
-    Load the dictionary from data.json. If it doesn't exist,
-    create it with initial values {"counter": 0, "chats": {}}.
-    """
     if not os.path.exists(DATA_FILE):
         data = {"counter": 0, "chats": {}}
         with open(DATA_FILE, "w") as f:
             json.dump(data, f, indent=2)
         return data
-
     with open(DATA_FILE, "r") as f:
         return json.load(f)
 
 def save_data(data):
-    """
-    Save the dictionary `data` back into data.json.
-    """
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
 def get_next_counter(data):
-    """
-    Increment data["counter"] by 1, save, and return the new value.
-    """
     data["counter"] += 1
     save_data(data)
     return data["counter"]
 
-# ------------------------ Bot Handlers ------------------------
+# ─── Bot handlers ──────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle the /start command. Send a button labeled "Create Mail".
-    """
-    keyboard = [
-        [InlineKeyboardButton("Create Mail", callback_data="create_mail")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+    keyboard = [[ InlineKeyboardButton("Create Mail", callback_data="create_mail") ]]
     await update.message.reply_text(
         f"Hello! Press “Create Mail” to generate a new mailbox on the {config.DOMAIN_NAME} domain.",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handle inline button presses:
-      - create_mail  → create a new inbox and show its address/ID
-      - change_mail  → generate the next address in sequence
-      - get_otp      → fetch the latest email (OTP/code) from the current inbox
-    """
     query = update.callback_query
-    await query.answer()  # Acknowledge the callback so Telegram stops showing the “Loading…” spinner.
+    await query.answer()
 
     data = load_data()
     chat_id = str(query.message.chat.id)
-    action = query.data
-    logger.info(f"Button pressed: {action} in chat {chat_id}")
+    action  = query.data
 
-    # Prepare MailSlurp configuration
-    configuration = Configuration()
-    configuration.api_key["x-api-key"] = config.MAILSLURP_API_KEY
+    # prepare MailSlurp client
+    cfg = Configuration()
+    cfg.api_key["x-api-key"] = config.MAILSLURP_API_KEY
 
-    with ApiClient(configuration) as api_client:
-        inbox_ctrl = InboxControllerApi(api_client)
-        email_ctrl = EmailControllerApi(api_client)
+    with ApiClient(cfg) as api_client:
+        inbox_api    = InboxControllerApi(api_client)
+        wait_api     = WaitForControllerApi(api_client)
 
-        # 1) CREATE or CHANGE Mail
         if action in ("create_mail", "change_mail"):
+            # 1) CREATE / CHANGE mailbox
+            num = get_next_counter(data)
+            email_addr = f"admin{num}@{config.DOMAIN_NAME}"
             try:
-                # Get next sequential number (1, 2, 3, …)
-                num = get_next_counter(data)
-                email_addr = f"admin{num}@{config.DOMAIN_NAME}"
-
-                # Create the inbox by passing email_address directly:
-                inbox = inbox_ctrl.create_inbox(email_address=email_addr)
-
-                # Save inbox_id, email, and number for this chat
+                inbox = inbox_api.create_inbox(email_address=email_addr)
                 data["chats"][chat_id] = {
                     "inbox_id": inbox.id,
-                    "email": inbox.email_address,
-                    "number": num
+                    "email":    inbox.email_address
                 }
                 save_data(data)
 
-                # Reply to the user with a new message (not editing the old one)
                 text = (
                     f"🆕 New mailbox created:\n"
                     f"Email: {inbox.email_address}\n"
@@ -125,97 +90,69 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 buttons = [
                     [
                         InlineKeyboardButton("Change Mail", callback_data="change_mail"),
-                        InlineKeyboardButton("Get OTP", callback_data="get_otp")
+                        InlineKeyboardButton("Get OTP",    callback_data="get_otp")
                     ]
                 ]
-                await query.message.reply_text(
-                    text,
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-                logger.info(f"Created inbox {inbox.email_address} (ID={inbox.id}) for chat {chat_id}")
+                await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+                logger.info(f"Created inbox {inbox.email_address} for chat {chat_id}")
 
             except Exception as e:
-                # If anything goes wrong in MailSlurp, log + inform the user
-                logger.exception(f"Failed to create/change inbox for chat {chat_id}: {e!r}")
+                logger.exception(f"Error creating inbox: {e}")
                 await query.message.reply_text(
-                    "❌ An error occurred while creating the mailbox. "
-                    "Please check the server logs for details."
+                    "❌ Failed to create mailbox. Check logs."
                 )
 
-        # 2) GET OTP (latest email content)
         elif action == "get_otp":
+            # 2) FETCH latest email via wait_for_latest_email
             if chat_id not in data["chats"]:
-                await query.message.reply_text(
-                    "Please create a mailbox first by pressing “Create Mail.”"
-                )
+                await query.message.reply_text("Please create a mailbox first.")
                 return
 
             inbox_id = data["chats"][chat_id]["inbox_id"]
             try:
-                # Fetch the single most-recent email
-                emails = email_ctrl.get_emails_for_inbox(
+                # wait_for_latest_email will poll up to 30 seconds
+                email = wait_api.wait_for_latest_email(
                     inbox_id=inbox_id,
-                    limit=1,
-                    sort="DESC"
+                    timeout=30000,       # millis
+                    unread_only=True
                 )
             except Exception as e:
-                logger.exception(f"Error fetching emails for inbox {inbox_id}: {e!r}")
+                logger.exception(f"Error waiting for email in {inbox_id}: {e}")
                 await query.message.reply_text(
-                    "❌ Error while fetching emails from MailSlurp. "
-                    "Please check the logs."
+                    "❌ Error fetching email. Make sure an email has arrived."
                 )
                 return
 
-            if not emails:
-                await query.message.reply_text("📭 There are no emails in the inbox yet.")
-                return
+            # build response
+            subject = email.subject     or "<no subject>"
+            sender  = email.from_       or "<unknown sender>"
+            body    = email.body        or "<empty body>"
 
-            latest = emails[0]
-            try:
-                full_email = email_ctrl.get_email(latest.id)
-            except Exception as e:
-                logger.exception(f"Error retrieving email ID {latest.id}: {e!r}")
-                await query.message.reply_text(
-                    "❌ Failed to retrieve the full email. Please try again."
-                )
-                return
-
-            subject = full_email.subject or "<no subject>"
-            sender = full_email.from_ or "<unknown sender>"
-            body = full_email.body or "<empty email body>"
-
-            text = (
+            resp = (
                 f"✉️ Latest email:\n\n"
                 f"Subject: {subject}\n"
                 f"From: {sender}\n\n"
                 f"Content:\n{body}"
             )
-            await query.message.reply_text(text)
-            logger.info(f"Sent latest email from inbox {inbox_id} to chat {chat_id}")
+            await query.message.reply_text(resp)
+            logger.info(f"Delivered email from {inbox_id} to chat {chat_id}")
 
         else:
-            # Unexpected callback_data—unlikely, but handle gracefully
-            logger.warning(f"Unknown callback_data received: {action}")
-            await query.message.reply_text("❓ Unknown command. Please try /start again.")
+            await query.message.reply_text("❓ Unknown command. Please /start again.")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Log any exception that occurs while handling an update.
-    """
-    logger.error("Exception while handling an update:", exc_info=context.error)
+# ─── Error handler ──────────────────────────────────────────────
+async def error_handler(update, context):
+    logger.error("Update failed", exc_info=context.error)
 
-# ------------------------ Main Entry Point ------------------------
+# ─── Main ──────────────────────────────────────────────────────
 def main():
-    # Ensure data.json exists (or create it if missing)
     _ = load_data()
-
-    # Build the Telegram bot application
     app = ApplicationBuilder().token(config.TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_error_handler(error_handler)
 
-    print("Bot is running...")
+    print("Bot is running…")
     app.run_polling()
 
 if __name__ == "__main__":
